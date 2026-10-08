@@ -1,37 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""百度贴吧自动签到
-
-接口来源：手机端客户端协议，取自实测可用的开源实现并经核对（见 README 鸣谢）。
-不是猜的——三个端点与签名算法如下：
-
-    GET  https://tieba.baidu.com/dc/common/tbs          取 tbs（BDUSS 走 Cookie）
-    POST https://c.tieba.baidu.com/c/f/forum/like       关注的贴吧列表（分页）
-    POST https://c.tieba.baidu.com/c/c/forum/sign       单个贴吧签到
-
-签名：sign = MD5( 按 key 升序拼接 "k=v" + "tiebaclient!!!" ).upper()
-
-业务码（不是 HTTP 状态码）：
-    error_code == "0"      签到成功（user_info.user_sign_rank 是签到排名）
-    error_code == "160002" 今日已签到（幂等，不重复领）
-    error_code == "340006" 该贴吧被屏蔽
-
-设计要点：
-  * 幂等：先取列表再逐个签，已签到的按「已签到」处理，不算失败
-  * 节流：贴吧之间随机 1.0-2.5s，每 10 个额外 5-10s；失败的等 15s 刷新 tbs 后重试一轮
-  * 脱敏：BDUSS 全程不进日志；响应体打印前抹掉凭据字段
-  * 日志脱敏：**默认不打印贴吧名**，只给「序号 + 短指纹」
-    （如 `[123/717 fp=a1b2c3d4]`）。失败时同样不打名字，只给指纹，
-    便于跨运行关联同一个贴吧，又不会把关注列表写进日志。
-    本机调试要看名字就设 `TIEBA_LOG_NAMES=1`。
-    → 这样即使仓库公开，Actions 日志也不会泄露你的关注画像。
-  * 尾部：推送正文与日志都带统一尾部（来源 / 运行记录 / Token 认证日期）
-    —— BDUSS 是不透明凭据、没有签发时间，所以**不显示有效期**，不伪造
-  * 失败会 sys.exit(1)，让工作流真正报红，不被绿勾掩盖
-
-所有凭据走环境变量注入，脚本本身零密钥。
+"""百度贴吧自动签到（多账号版）
+在原版基础上改造：TIEBA_BDUSS 支持用英文逗号分隔多个 BDUSS，
+脚本会依次登录每个账号签到，最后合并成一条 PushPlus 推送。
+其余逻辑（接口、签名、节流、脱敏、重试）与原版完全一致。
 """
-
 import hashlib
 import json
 import os
@@ -44,36 +17,25 @@ import urllib.request
 from datetime import datetime, timedelta, timezone
 
 # ==================== 常量：真实接口 ====================
-
 SIGN_KEY = "tiebaclient!!!"
 TBS_URL = "https://tieba.baidu.com/dc/common/tbs"
 LIKE_URL = "https://c.tieba.baidu.com/c/f/forum/like"
 SIGN_URL = "https://c.tieba.baidu.com/c/c/forum/sign"
-
 USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/95.0.4638.69 Safari/537.36"
 )
-
 CLIENT_ID = "wappc_1534235498291_488"
 CLIENT_VERSION = "9.7.8.0"
-
 BJ_TZ = timezone(timedelta(hours=8))
 TIMEOUT = 15
 
-# 节流参数（可用环境变量覆盖）。
-# 关注的贴吧越多，这两项越决定总耗时：717 个吧在 1.0-2.5s 档位下要跑约 40 分钟。
-# 默认取 0.3-0.8s，请求本身的往返已经构成自然节流。
 MIN_DELAY = float(os.environ.get("TIEBA_MIN_DELAY", "0.3"))
 MAX_DELAY = float(os.environ.get("TIEBA_MAX_DELAY", "0.8"))
-# 每 N 个贴吧额外休息一次
 REST_EVERY = int(os.environ.get("TIEBA_REST_EVERY", "30"))
 REST_MIN = float(os.environ.get("TIEBA_REST_MIN", "2"))
 REST_MAX = float(os.environ.get("TIEBA_REST_MAX", "4"))
-
-# 是否在日志里打印贴吧名。默认关闭——公开仓库的 Actions 日志
-# 对所有登录用户可见，打名字等于公开你的关注列表。本机调试时设 1 打开。
 SHOW_NAMES = os.environ.get("TIEBA_LOG_NAMES", "").strip().lower() in ("1", "true", "yes", "on")
 
 
@@ -86,7 +48,6 @@ def log(msg: str) -> None:
 
 
 def fmt_duration(sec: float) -> str:
-    """把秒数格式化成「1 小时 2 分 3 秒」。"""
     sec = max(0, int(sec))
     m, s = divmod(sec, 60)
     if m >= 60:
@@ -96,7 +57,6 @@ def fmt_duration(sec: float) -> str:
 
 
 # ==================== 脱敏 ====================
-
 _SENSITIVE_KEYS = {
     "bduss", "stoken", "tbs", "token", "cookie", "password",
     "secret", "authorization", "session", "ptoken",
@@ -104,7 +64,6 @@ _SENSITIVE_KEYS = {
 
 
 def sanitize(value):
-    """递归脱敏，日志里不出现任何凭据字段。"""
     if isinstance(value, dict):
         return {
             k: ("<已脱敏>" if str(k).lower() in _SENSITIVE_KEYS else sanitize(v))
@@ -116,33 +75,25 @@ def sanitize(value):
 
 
 def mask_cred(value: str) -> str:
-    """只报长度，不报内容。"""
     if not value:
         return "<未配置>"
     return f"***(len={len(value)})"
 
 
 def short_fp(name: str) -> str:
-    """贴吧名的短指纹。稳定（同一个吧每次一样），但不可反推名字。
-
-    用途：跨运行关联同一个贴吧、定位问题，同时不把名字写进日志。
-    """
     if not name:
         return "--------"
     return hashlib.sha1(name.encode("utf-8")).hexdigest()[:8]
 
 
 def tag(name: str, idx: int, total: int) -> str:
-    """条目标识。默认「序号 + 短指纹」，只有显式开启才打名字。"""
     if SHOW_NAMES and name:
         return f"【{name}】({idx}/{total})"
     return f"[{idx}/{total} fp={short_fp(name)}]"
 
 
 # ==================== HTTP ====================
-
 def http_json(url, data=None, cookie=None):
-    """POST/GET 取 JSON。返回 (dict|None, http_status)。不抛异常。"""
     headers = {"User-Agent": USER_AGENT}
     body = None
     if data is not None:
@@ -150,7 +101,6 @@ def http_json(url, data=None, cookie=None):
         headers["Content-Type"] = "application/x-www-form-urlencoded"
     if cookie:
         headers["Cookie"] = cookie
-
     req = urllib.request.Request(url, data=body, headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
@@ -168,7 +118,6 @@ def http_json(url, data=None, cookie=None):
 
 
 def request_with_retry(url, data=None, cookie=None, retry=3):
-    """带指数退避的请求。"""
     for i in range(retry):
         result, status = http_json(url, data, cookie)
         if result is not None:
@@ -180,9 +129,7 @@ def request_with_retry(url, data=None, cookie=None, retry=3):
 
 
 # ==================== 签名 ====================
-
 def sign(data: dict) -> str:
-    """贴吧客户端签名：MD5(升序拼接 k=v + SIGN_KEY).upper()"""
     raw = "".join(f"{k}={data[k]}" for k in sorted(data)) + SIGN_KEY
     return hashlib.md5(raw.encode("utf-8")).hexdigest().upper()
 
@@ -194,21 +141,18 @@ def signed(data: dict) -> dict:
 
 
 # ==================== 业务 ====================
-
 class TiebaClient:
     def __init__(self, bduss: str):
         self.bduss = bduss
         self.cookie = f"BDUSS={bduss}"
 
     def get_tbs(self):
-        """取 tbs。BDUSS 是否有效由后续签到请求自然验证。"""
         result = request_with_retry(TBS_URL, cookie=self.cookie)
         if not result:
             return None
         return result.get("tbs", "")
 
     def get_favorites(self):
-        """分页取关注的贴吧列表。"""
         forums, page_no = [], 1
         while True:
             data = signed({
@@ -229,7 +173,6 @@ class TiebaClient:
             if not result:
                 log("  获取贴吧列表失败，停止翻页")
                 break
-
             forum_list = result.get("forum_list") or {}
             for key in ("non-gconforum", "gconforum"):
                 items = forum_list.get(key, [])
@@ -237,17 +180,13 @@ class TiebaClient:
                     forums.extend(items)
                 elif isinstance(items, dict):
                     forums.append(items)
-
             if result.get("has_more") != "1":
                 break
             page_no += 1
             time.sleep(random.uniform(1, 2))
-
-        log(f"共获取到 {len(forums)} 个关注的贴吧")
         return forums
 
     def sign_forum(self, fid: str, name: str, tbs: str) -> dict:
-        """单个贴吧签到。返回 {status, rank, message}"""
         data = signed({
             "BDUSS": self.bduss,
             "_client_type": "2",
@@ -263,10 +202,8 @@ class TiebaClient:
         result = request_with_retry(SIGN_URL, data)
         if not result:
             return {"status": "error", "rank": None, "message": "网络请求失败"}
-
         code = str(result.get("error_code", ""))
         msg = result.get("error_msg", "")
-
         if code == "0":
             rank = (result.get("user_info") or {}).get("user_sign_rank")
             return {"status": "success", "rank": int(rank) if rank else None,
@@ -280,13 +217,12 @@ class TiebaClient:
 
 
 # ==================== 状态文件（首次认证日期） ====================
-
 def load_state(path: str) -> dict:
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
-        if isinstance(data, dict):
-            return data
+            if isinstance(data, dict):
+                return data
     except Exception:
         pass
     return {}
@@ -297,15 +233,10 @@ def save_state(path: str, state: dict) -> None:
         with open(path, "w", encoding="utf-8") as f:
             json.dump(state, f, ensure_ascii=False, indent=2)
     except Exception:
-        pass  # 只读环境下放弃持久化，下次运行会重新记录
+        pass
 
 
 def auth_date(bduss: str, path: str) -> str:
-    """BDUSS 是不透明凭据，没有签发时间。
-
-    取「该凭据首次在本流水线认证成功的日期」，写进状态文件跨运行保留。
-    只存 SHA-256 短指纹，不落明文。
-    """
     fp = hashlib.sha256(bduss.encode("utf-8")).hexdigest()[:12]
     state = load_state(path)
     creds = state.get("credentials") or {}
@@ -319,12 +250,7 @@ def auth_date(bduss: str, path: str) -> str:
 
 
 # ==================== 推送 ====================
-
-def build_footer(bduss: str, state_path: str) -> str:
-    """统一尾部：来源 + 运行记录 + Token 认证日期。
-
-    BDUSS 解析不出有效期，按规则**不伪造**，所以这里没有「凭证有效期至」一行。
-    """
+def build_footer(bduss_list, state_path: str) -> str:
     lines = []
     if os.environ.get("GITHUB_ACTIONS") == "true":
         wf = os.environ.get("GITHUB_WORKFLOW") or ""
@@ -336,24 +262,19 @@ def build_footer(bduss: str, state_path: str) -> str:
             lines.append(f"运行记录：{base}/{repo}/actions/runs/{run_id}")
     else:
         lines.append("来源：本地运行")
-
-    if bduss:
-        lines.append(f"Token 认证日期：{auth_date(bduss, state_path)}")
+    dates = [auth_date(b, state_path) for b in bduss_list if b]
+    if dates:
+        lines.append(f"Token 认证日期：{', '.join(sorted(set(dates)))}")
     return "\n".join(lines)
 
 
-def push_notify(title: str, content: str, bduss: str, state_path: str) -> bool:
-    """PushPlus 推送。token 走 POST body，不进 URL（URL 会进日志）。"""
+def push_notify(title: str, content: str, bduss_list, state_path: str) -> bool:
     token = os.environ.get("PUSHPLUS_TOKEN", "").strip()
-    body = f"{content}\n\n{'-' * 22}\n{build_footer(bduss, state_path)}"
-
-    # 尾部同时 log 一份，否则只能在推送里看到、CI 日志里没法验证
+    body = f"{content}\n\n{'-' * 22}\n{build_footer(bduss_list, state_path)}"
     log(f"推送正文:\n{body}")
-
     if not token:
         log("[推送] 未配置 PUSHPLUS_TOKEN，跳过推送")
         return False
-
     result, status = http_json(
         "https://www.pushplus.plus/send",
         data={"token": token, "title": title, "content": body, "template": "txt"},
@@ -364,129 +285,171 @@ def push_notify(title: str, content: str, bduss: str, state_path: str) -> bool:
     return ok
 
 
-# ==================== 主流程 ====================
-
-def main() -> int:
-    log("=== 百度贴吧自动签到 ===")
-
-    bduss = os.environ.get("TIEBA_BDUSS", "").strip()
-    state_path = os.environ.get("TIEBA_STATE_FILE", ".tieba-state.json")
-
-    if not bduss:
-        push_notify("❌ 贴吧签到失败", "未配置 TIEBA_BDUSS，请在仓库 Secrets 中添加。",
-                    "", state_path)
-        return 1
-
+# ==================== 单账号签到 ====================
+def sign_one_account(bduss: str, account_label: str, state_path: str):
+    """跑一个账号的完整签到流程。返回 dict 汇总结果。"""
+    log(f"--- {account_label} 开始（BDUSS={mask_cred(bduss)}）---")
     started = time.time()
-    log(f"凭据检查：BDUSS={mask_cred(bduss)}")
     client = TiebaClient(bduss)
 
     t0 = time.time()
     tbs = client.get_tbs()
     if not tbs:
-        push_notify("❌ 贴吧签到失败",
-                    "获取 tbs 失败，通常意味着 BDUSS 已失效。请重新从浏览器 F12 取一次。\n"
-                    f"耗时：{fmt_duration(time.time() - started)}",
-                    bduss, state_path)
-        return 1
-    log(f"tbs 获取成功（{fmt_duration(time.time() - t0)}）")
+        log(f"{account_label} 获取 tbs 失败，BDUSS 可能已失效")
+        return {
+            "label": account_label, "ok": False, "reason": "BDUSS 失效",
+            "total": 0, "success": 0, "exist": 0, "shield": 0, "error": 0,
+            "failed_fp": [], "elapsed": time.time() - started,
+        }
+    log(f"{account_label} tbs 获取成功（{fmt_duration(time.time() - t0)}）")
 
-    t0 = time.time()
     forums = client.get_favorites()
     if not forums:
-        push_notify("⚠️ 贴吧签到",
-                    "未获取到关注的贴吧（可能 BDUSS 失效或未关注任何贴吧）。\n"
-                    f"耗时：{fmt_duration(time.time() - started)}",
-                    bduss, state_path)
-        return 1
+        log(f"{account_label} 未获取到关注的贴吧")
+        return {
+            "label": account_label, "ok": False, "reason": "未取到贴吧列表",
+            "total": 0, "success": 0, "exist": 0, "shield": 0, "error": 0,
+            "failed_fp": [], "elapsed": time.time() - started,
+        }
+    log(f"{account_label} 共获取到 {len(forums)} 个关注的贴吧")
 
     total = len(forums)
     stats = {"success": 0, "exist": 0, "shield": 0, "error": 0}
     failed = []
-
     est = total * ((MIN_DELAY + MAX_DELAY) / 2 + 1.5) / 60
-    log(f"开始第 1 轮签到，共 {total} 个贴吧（预计约 {est:.0f} 分钟）")
+    log(f"{account_label} 开始第 1 轮签到，共 {total} 个（预计约 {est:.0f} 分钟）")
 
     for idx, forum in enumerate(forums):
         time.sleep(random.uniform(MIN_DELAY, MAX_DELAY))
         if (idx + 1) % REST_EVERY == 0:
             rest = random.uniform(REST_MIN, REST_MAX)
-            log(f"  已签到 {idx + 1}/{total}，休息 {rest:.1f}s")
+            log(f"  {account_label} 已签 {idx + 1}/{total}，休息 {rest:.1f}s")
             time.sleep(rest)
-
         name = forum.get("name", "")
         res = client.sign_forum(forum.get("id", ""), name, tbs)
         stats[res["status"]] += 1
-
         mark = tag(name, idx + 1, total)
         if res["status"] == "success":
             rank_str = f"，第 {res['rank']} 个签到" if res["rank"] else ""
-            log(f"  {mark} 签到成功{rank_str}")
+            log(f"  {account_label} {mark} 签到成功{rank_str}")
         elif res["status"] == "exist":
-            log(f"  {mark} 已签到")
+            log(f"  {account_label} {mark} 已签到")
         elif res["status"] == "shield":
-            log(f"  {mark} 被屏蔽")
+            log(f"  {account_label} {mark} 被屏蔽")
         else:
-            # 失败也只给指纹，不打名字
-            log(f"  {mark} 失败：{res['message']}")
+            log(f"  {account_label} {mark} 失败：{res['message']}")
             failed.append(forum)
 
-    # 第二轮：刷新 tbs 后重试失败的
+    # 第二轮重试
     final_failed = []
     if failed:
-        log(f"第 1 轮结束，{len(failed)} 个失败，等待 15s 后刷新 tbs 重试")
+        log(f"{account_label} 第 1 轮结束，{len(failed)} 个失败，15s 后刷新 tbs 重试")
         time.sleep(15)
         new_tbs = client.get_tbs()
         if new_tbs:
             tbs = new_tbs
-            log("  已刷新 tbs")
-
-        for idx, forum in enumerate(failed):
+        for forum in failed:
             time.sleep(random.uniform(MIN_DELAY, MAX_DELAY))
             name = forum.get("name", "")
             res = client.sign_forum(forum.get("id", ""), name, tbs)
-            mark = tag(name, idx + 1, len(failed))
+            mark = tag(name, 0, 0)
             if res["status"] == "success":
                 stats["error"] -= 1
                 stats["success"] += 1
-                log(f"  重试 {mark} 成功")
+                log(f"  {account_label} 重试 {mark} 成功")
             elif res["status"] == "exist":
                 stats["error"] -= 1
                 stats["exist"] += 1
-                log(f"  重试 {mark} 已签到")
+                log(f"  {account_label} 重试 {mark} 已签到")
             elif res["status"] == "shield":
                 stats["error"] -= 1
                 stats["shield"] += 1
-                log(f"  重试 {mark} 被屏蔽")
+                log(f"  {account_label} 重试 {mark} 被屏蔽")
             else:
                 final_failed.append(short_fp(name))
-                log(f"  重试 {mark} 仍失败：{res['message']}")
+                log(f"  {account_label} 重试 {mark} 仍失败：{res['message']}")
 
     elapsed = time.time() - started
     per = elapsed / total if total else 0
-    lines = [
-        f"贴吧总数：{total}",
-        f"签到成功：{stats['success']}",
-        f"已经签到：{stats['exist']}",
-        f"被屏蔽的：{stats['shield']}",
-        f"签到失败：{stats['error']}",
-        f"耗时：{fmt_duration(elapsed)}（平均 {per:.1f} 秒/个）",
-        f"时间：{now_bj()}",
-    ]
-    if final_failed:
-        # 只给指纹，不给名字（想定位就本机设 TIEBA_LOG_NAMES=1 重跑）
-        lines.append(f"重试失败的条目指纹：{', '.join(final_failed)}")
-        lines.append("（指纹是贴吧名的短哈希，本机设 TIEBA_LOG_NAMES=1 可显示名字）")
-    summary = "\n".join(lines)
-    log("========== 签到汇总 ==========\n" + summary + "\n==============================")
-    log(f"总耗时：{fmt_duration(elapsed)}")
+    log(f"{account_label} 完成：成功 {stats['success']} / 已签 {stats['exist']} / "
+        f"屏蔽 {stats['shield']} / 失败 {stats['error']}，耗时 {fmt_duration(elapsed)}")
 
-    # 已签到 / 被屏蔽 都属于正常结果，不算失败
-    if stats["error"] > 0:
-        push_notify("❌ 贴吧签到异常", summary + "\n\n请查看运行日志。", bduss, state_path)
+    return {
+        "label": account_label, "ok": True, "reason": "",
+        "total": total, "success": stats["success"], "exist": stats["exist"],
+        "shield": stats["shield"], "error": stats["error"],
+        "failed_fp": final_failed, "elapsed": elapsed, "per": per,
+    }
+
+
+# ==================== 主流程 ====================
+def main() -> int:
+    log("=== 百度贴吧自动签到（多账号版） ===")
+    raw = os.environ.get("TIEBA_BDUSS", "").strip()
+    state_path = os.environ.get("TIEBA_STATE_FILE", ".tieba-state.json")
+
+    if not raw:
+        push_notify("❌ 贴吧签到失败", "未配置 TIEBA_BDUSS，请在仓库 Secrets 中添加。",
+                    [], state_path)
         return 1
 
-    push_notify("✅ 贴吧签到完成", summary, bduss, state_path)
+    # 支持用英文逗号分隔多个 BDUSS
+    bduss_list = [b.strip() for b in raw.split(",") if b.strip()]
+    log(f"共 {len(bduss_list)} 个账号待签到")
+
+    all_results = []
+    total_started = time.time()
+    for i, bduss in enumerate(bduss_list, 1):
+        label = f"账号{i}" if len(bduss_list) > 1 else "账号"
+        r = sign_one_account(bduss, label, state_path)
+        all_results.append((bduss, r))
+        # 账号之间间隔一下，别连着打
+        if i < len(bduss_list):
+            gap = random.uniform(5, 10)
+            log(f"账号切换，休息 {gap:.1f}s")
+            time.sleep(gap)
+
+    total_elapsed = time.time() - total_started
+
+    # 汇总推送内容
+    lines = []
+    grand = {"total": 0, "success": 0, "exist": 0, "shield": 0, "error": 0}
+    any_error = False
+    any_invalid = False
+    for bduss, r in all_results:
+        if not r["ok"]:
+            any_invalid = True
+            lines.append(f"【{r['label']}】失败：{r['reason']}")
+            continue
+        grand["total"] += r["total"]
+        grand["success"] += r["success"]
+        grand["exist"] += r["exist"]
+        grand["shield"] += r["shield"]
+        grand["error"] += r["error"]
+        head = f"【{r['label']}】共 {r['total']} 个：成功 {r['success']}，已签 {r['exist']}，屏蔽 {r['shield']}，失败 {r['error']}"
+        lines.append(head)
+        if r["error"] > 0:
+            any_error = True
+        if r["failed_fp"]:
+            lines.append(f"  重试失败指纹：{', '.join(r['failed_fp'])}")
+
+    lines.append("")
+    lines.append(f"合计：成功 {grand['success']} / 已签 {grand['exist']} / "
+                 f"屏蔽 {grand['shield']} / 失败 {grand['error']}")
+    lines.append(f"总耗时：{fmt_duration(total_elapsed)}")
+    lines.append(f"时间：{now_bj()}")
+
+    summary = "\n".join(lines)
+    log("========== 全部账号汇总 ==========\n" + summary + "\n================================")
+
+    push_bduss = [b for b, _ in all_results]
+    if any_invalid:
+        push_notify("❌ 贴吧签到异常", summary, push_bduss, state_path)
+        return 1
+    if any_error:
+        push_notify("⚠️ 贴吧签到有失败", summary, push_bduss, state_path)
+        return 1
+    push_notify("✅ 贴吧签到完成", summary, push_bduss, state_path)
     return 0
 
 
